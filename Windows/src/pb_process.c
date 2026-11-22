@@ -230,7 +230,7 @@ static BOOL process_basename_from_snapshot(DWORD pid, char *name, DWORD name_siz
     return found;
 }
 
-BOOL get_process_name_from_pid(DWORD pid, char *name, DWORD name_size)
+static BOOL process_name_uncached(DWORD pid, char *name, DWORD name_size)
 {
     HANDLE hProcess;
     WCHAR full_path_w[MAX_PATH];
@@ -265,6 +265,19 @@ BOOL get_process_name_from_pid(DWORD pid, char *name, DWORD name_size)
 
     CloseHandle(hProcess);
     return process_basename_from_snapshot(pid, name, name_size);
+}
+
+BOOL get_process_name_from_pid(DWORD pid, char *name, DWORD name_size)
+{
+    const PB_DECISION *cached = pb_current_decision ? pb_current_decision : pb_resolving_decision;
+    if (cached && cached->pid == pid && cached->process[0]) {
+        if (name != cached->process) strncpy_s(name, name_size, cached->process, _TRUNCATE);
+        return TRUE;
+    }
+    BOOL ok = process_name_uncached(pid, name, name_size);
+    if (ok && pb_resolving_decision && pb_resolving_decision->pid == pid && name != pb_resolving_decision->process)
+        strncpy_s(pb_resolving_decision->process, sizeof(pb_resolving_decision->process), name, _TRUNCATE);
+    return ok;
 }
 
 //  cache pid

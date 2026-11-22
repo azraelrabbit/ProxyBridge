@@ -43,6 +43,13 @@ __declspec(thread) UINT32 g_tl_rule_id = 0;
 
 RuleAction check_process_rule_v6(const UINT8 src_ip6[16], UINT16 src_port, const UINT8 dest_ip6[16], UINT16 dest_port, BOOL is_udp, DWORD *out_pid, UINT32 *out_proxy_config_id)
 {
+    if (pb_current_decision) {
+        if (out_pid) *out_pid = pb_current_decision->pid;
+        if (out_proxy_config_id) *out_proxy_config_id = pb_current_decision->proxy_id;
+        g_tl_rule_id = pb_current_decision->rule_id;
+        g_tl_rule_localhost = pb_current_decision->localhost;
+        return pb_current_decision->action;
+    }
     g_tl_rule_localhost = FALSE; g_tl_rule_id = 0;
     DWORD pid;
     char process_name[MAX_PROCESS_NAME];
@@ -501,6 +508,8 @@ BOOL match_domain_list(const char *domain_list, const char *domain)
     return matched;
 }
 
+#include "pb_rule_program.h"
+
 // TRUE if the rule actually restricts by domain (non-empty and not "*").
 BOOL rule_has_domain_filter(const PROCESS_RULE *rule)
 {
@@ -693,6 +702,12 @@ RuleAction match_rule(const char *process_name, UINT32 dest_ip, UINT16 dest_port
         if (out_proxy_config_id != NULL) *out_proxy_config_id = 0;
         return RULE_ACTION_DIRECT;
     }
+    PB_RULE_SNAPSHOT *snapshot = snapshot_acquire();
+    if (snapshot) {
+        RuleAction action = snapshot_match(snapshot, process_name, &dest_ip, FALSE, dest_port, is_udp, out_proxy_config_id);
+        snapshot_release(snapshot);
+        return action;
+    }
     AcquireSRWLockShared(&g_rules_lock);
     RuleAction action = match_rule_inner(process_name, dest_ip, dest_port, is_udp, out_proxy_config_id);
     ReleaseSRWLockShared(&g_rules_lock);
@@ -790,6 +805,12 @@ RuleAction match_rule_v6(const char *process_name, const UINT8 dest_ip6[16], UIN
         if (out_proxy_config_id != NULL) *out_proxy_config_id = 0;
         return RULE_ACTION_DIRECT;
     }
+    PB_RULE_SNAPSHOT *snapshot = snapshot_acquire();
+    if (snapshot) {
+        RuleAction action = snapshot_match(snapshot, process_name, dest_ip6, TRUE, dest_port, is_udp, out_proxy_config_id);
+        snapshot_release(snapshot);
+        return action;
+    }
     AcquireSRWLockShared(&g_rules_lock);
     RuleAction action = match_rule_v6_inner(process_name, dest_ip6, dest_port, is_udp, out_proxy_config_id);
     ReleaseSRWLockShared(&g_rules_lock);
@@ -798,6 +819,13 @@ RuleAction match_rule_v6(const char *process_name, const UINT8 dest_ip6[16], UIN
 
 RuleAction check_process_rule(UINT32 src_ip, UINT16 src_port, UINT32 dest_ip, UINT16 dest_port, BOOL is_udp, DWORD *out_pid, UINT32 *out_proxy_config_id)
 {
+    if (pb_current_decision) {
+        if (out_pid) *out_pid = pb_current_decision->pid;
+        if (out_proxy_config_id) *out_proxy_config_id = pb_current_decision->proxy_id;
+        g_tl_rule_id = pb_current_decision->rule_id;
+        g_tl_rule_localhost = pb_current_decision->localhost;
+        return pb_current_decision->action;
+    }
     g_tl_rule_localhost = FALSE; g_tl_rule_id = 0;
     DWORD pid;
     char process_name[MAX_PROCESS_NAME];
@@ -939,6 +967,7 @@ PROXYBRIDGE_API UINT32 ProxyBridge_AddRule(const char* process_name, const char*
         strcpy_s(rule->target_domains, 2, "*");
     }
 
+    rule->program = program_compile(rule->process_name, rule->target_hosts, rule->target_ports, rule->target_domains);
     rule->action = action;
     rule->enabled = TRUE;
     rule->next = NULL;
@@ -958,6 +987,7 @@ PROXYBRIDGE_API UINT32 ProxyBridge_AddRule(const char* process_name, const char*
         tail->next = rule;
     }
     UINT32 new_id = rule->rule_id;
+    snapshot_publish_locked();
     ReleaseSRWLockExclusive(&g_rules_lock);
 
     update_has_active_rules();
@@ -984,6 +1014,7 @@ PROXYBRIDGE_API BOOL ProxyBridge_EnableRule(UINT32 rule_id)
         }
         rule = rule->next;
     }
+    snapshot_publish_locked();
     ReleaseSRWLockExclusive(&g_rules_lock);
 
     if (found)
@@ -1012,6 +1043,7 @@ PROXYBRIDGE_API BOOL ProxyBridge_DisableRule(UINT32 rule_id)
         }
         rule = rule->next;
     }
+    snapshot_publish_locked();
     ReleaseSRWLockExclusive(&g_rules_lock);
 
     if (found)
@@ -1049,6 +1081,7 @@ PROXYBRIDGE_API BOOL ProxyBridge_DeleteRule(UINT32 rule_id)
                 free(rule->target_ports);
             if (rule->target_domains != NULL)
                 free(rule->target_domains);
+            program_release(rule->program);
             free(rule);
             found = TRUE;
             break;
@@ -1056,6 +1089,7 @@ PROXYBRIDGE_API BOOL ProxyBridge_DeleteRule(UINT32 rule_id)
         prev = rule;
         rule = rule->next;
     }
+    snapshot_publish_locked();
     ReleaseSRWLockExclusive(&g_rules_lock);
 
     if (found)
@@ -1088,6 +1122,8 @@ PROXYBRIDGE_API BOOL ProxyBridge_EditRule(UINT32 rule_id, const char* process_na
         return FALSE;
     }
 
+    PB_RULE_PROGRAM *new_program = program_compile(process_name, new_hosts, new_ports, new_domains);
+
     BOOL found = FALSE;
     AcquireSRWLockExclusive(&g_rules_lock);
     PROCESS_RULE *rule = rules_list;
@@ -1095,6 +1131,8 @@ PROXYBRIDGE_API BOOL ProxyBridge_EditRule(UINT32 rule_id, const char* process_na
     {
         if (rule->rule_id == rule_id)
         {
+            program_release(rule->program);
+            rule->program = new_program;
             strncpy_s(rule->process_name, sizeof(rule->process_name), process_name, _TRUNCATE);
 
             free(rule->target_hosts);
@@ -1113,10 +1151,12 @@ PROXYBRIDGE_API BOOL ProxyBridge_EditRule(UINT32 rule_id, const char* process_na
         }
         rule = rule->next;
     }
+    snapshot_publish_locked();
     ReleaseSRWLockExclusive(&g_rules_lock);
 
     if (!found)
     {
+        program_release(new_program);
         // rule_id not found - the pre-allocated strings were never installed, free them.
         free(new_hosts);
         free(new_ports);
@@ -1223,6 +1263,7 @@ PROXYBRIDGE_API BOOL ProxyBridge_MoveRuleToPosition(UINT32 rule_id, UINT32 new_p
         }
     }
 
+    snapshot_publish_locked();
     ReleaseSRWLockExclusive(&g_rules_lock);
 
     log_message("Moved rule ID %u to position %u", rule_id, new_position);
@@ -1261,5 +1302,21 @@ void update_has_active_rules(void)
     if (has_domain && !g_has_domain_rules && running)
         flush_dns_resolver_cache();
     g_has_domain_rules = has_domain;
+}
+
+void pb_rules_free(void)
+{
+    AcquireSRWLockExclusive(&g_rules_lock);
+    while (rules_list) {
+        PROCESS_RULE *r = rules_list; rules_list = r->next;
+        program_release(r->program);
+        free(r->target_hosts); free(r->target_ports); free(r->target_domains); free(r);
+    }
+    snapshot_publish_locked();
+    ReleaseSRWLockExclusive(&g_rules_lock);
+    AcquireSRWLockExclusive(&g_snapshot_lock);
+    PB_RULE_SNAPSHOT *old = g_snapshot; g_snapshot = NULL;
+    ReleaseSRWLockExclusive(&g_snapshot_lock);
+    snapshot_release(old);
 }
 

@@ -70,7 +70,7 @@ New-Item -ItemType Directory -Path $Out | Out-Null
 $wdDll = Join-Path $WinDivertPath "$Arch\WinDivert.dll"
 if (Test-Path $wdDll) { Copy-Item $wdDll $Out } else { Write-Host "WARNING: $wdDll not found; the engine tests need it to start" -ForegroundColor Yellow }
 
-$core = 'ProxyBridge.c','pb_util.c','pb_process.c','pb_rules.c','pb_proxy.c','pb_dns.c','pb_socks5.c','pb_http.c','pb_conntrack.c','pb_relay.c','pb_sockmap.c' | ForEach-Object { "src\$_" }
+$core = 'ProxyBridge.c','pb_util.c','pb_process.c','pb_rules.c','pb_proxy.c','pb_dns.c','pb_socks5.c','pb_http.c','pb_conntrack.c','pb_relay.c','pb_sockmap.c','pb_datapath.c' | ForEach-Object { "src\$_" }
 $warn = '/W3 /wd4100 /wd4189 /wd4267 /wd4244 /wd4996'
 $wdInc = "/I`"$WinDivertPath\include`""
 $wdLib = "/LIBPATH:`"$WinDivertPath\$Arch`""
@@ -92,6 +92,7 @@ $tests = @(
     @{ n='test_proto';           src=@('tests\test_proto.c');                               cl=$clPlain; link='';      ui=$false },
     @{ n='test_service';         src=@('tests\test_service.c');                             cl="$clPlain /DUNICODE /D_UNICODE"; link='user32.lib advapi32.lib'; ui=$false },
     @{ n='test_engine';          src=@('tests\test_engine.c') + $core;                      cl=$clCore;  link=$lnCore; ui=$false },
+    @{ n='test_datapath';        src=@('tests\test_datapath.c') + ($core | Where-Object { $_ -ne 'src\pb_datapath.c' }); cl=$clCore; link=$lnCore; ui=$false },
     @{ n='test_rules_match';     src=@('tests\test_rules_match.c') + $core;                 cl=$clCore;  link=$lnCore; ui=$false },
     @{ n='test_conntrack';       src=@('tests\test_conntrack.c') + $core;                   cl=$clCore;  link=$lnCore; ui=$false },
     @{ n='test_flows';           src=@('tests\test_flows.c') + $core;                       cl=$clCore;  link=$lnCore; ui=$false },

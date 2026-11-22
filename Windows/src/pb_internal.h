@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "windivert.h"
+#include "pb_datapath.h"
 
 typedef char pb_fd_setsize_fits_all_proxies[(FD_SETSIZE >= 2 * MAX_PROXY_CONFIGS + 4) ? 1 : -1];   // compile error if MAX_PROXY_CONFIGS grows past it
 
@@ -36,14 +37,8 @@ typedef char pb_fd_setsize_fits_all_proxies[(FD_SETSIZE >= 2 * MAX_PROXY_CONFIGS
 #define VERSION "4.3.0"
 #define PID_CACHE_SIZE 1024
 #define PID_CACHE_TTL_MS 30000
-// Single packet-processor thread eliminates TCP packet reordering.
-// With multiple threads each racing to WinDivertRecv+WinDivertSend, thread N+1
-// can re-inject its segment before thread N injects segment N, causing the
-// relay's TCP stack to send DUPACKs back to the browser.  The browser
-// interprets 3+ DUPACKs as loss, halves its congestion window, and upload
-// throughput collapses 50% A single ordered thread prevents this entirely.
-// One thread is fast enough at 200 Mbps with 1460-byte segments there are
-// 17 000 packets/sec a single core processes well over 200000 packets/sec.
+// One ordered batched packet consumer; owner/rule classification and callback
+// delivery run separately so slow new connections and GUI I/O cannot stall it.
 #define NUM_PACKET_THREADS 1
 #define CONNECTION_HASH_SIZE 4096
 #define SOCKS5_BUFFER_SIZE 1024
@@ -53,6 +48,7 @@ typedef char pb_fd_setsize_fits_all_proxies[(FD_SETSIZE >= 2 * MAX_PROXY_CONFIGS
 #define MAX_LIST_SIZE 65536  // max byte length for semicolon-delimited host/port/process lists
 
 typedef struct PROCESS_RULE {
+    struct PB_RULE_PROGRAM *program;  // immutable, shared with matching snapshots
     UINT32 rule_id;
     char process_name[MAX_RULE_PROCESS_LIST];
     char *target_hosts;   // Dynamic: IP filter "*", "192.168.*.*", "10.0.0.1;172.16.0.0"
@@ -319,6 +315,7 @@ RuleAction match_rule_v6_inner(const char *process_name, const UINT8 dest_ip6[16
 RuleAction match_rule_v6(const char *process_name, const UINT8 dest_ip6[16], UINT16 dest_port, BOOL is_udp, UINT32 *out_proxy_config_id);
 RuleAction check_process_rule(UINT32 src_ip, UINT16 src_port, UINT32 dest_ip, UINT16 dest_port, BOOL is_udp, DWORD *out_pid, UINT32 *out_proxy_config_id);
 void update_has_active_rules(void);
+void pb_rules_free(void);
 
 // ---- pb_proxy.c ----
 PROXY_CONFIG* find_proxy_config(UINT32 config_id);

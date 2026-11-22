@@ -10,7 +10,7 @@ param(
 $WinDivertPath = "C:\WinDivert-2.2.2-A"
 $SourcePath = "src"
 # Core split across modular translation units (see src\pb_internal.h).
-$SourceFile = "ProxyBridge.c pb_util.c pb_process.c pb_rules.c pb_proxy.c pb_dns.c pb_socks5.c pb_http.c pb_conntrack.c pb_relay.c pb_sockmap.c"
+$SourceFile = "ProxyBridge.c pb_util.c pb_process.c pb_rules.c pb_proxy.c pb_dns.c pb_socks5.c pb_http.c pb_conntrack.c pb_relay.c pb_sockmap.c pb_datapath.c"
 $SourceFiles = ($SourceFile.Split(' ') | ForEach-Object { "$SourcePath\$_" }) -join ' '
 $OutputDLL = "ProxyBridgeCore.dll"
 $OutputDir = "output"
@@ -99,7 +99,7 @@ function Compile-GCC {
 
     $cmd = "gcc -shared -O2 -flto -s -Wall -D_WIN32_WINNT=0x0601 -DPROXYBRIDGE_EXPORTS " +
            "-I`"$WinDivertPath\include`" " +
-           "$SourcePath\$SourceFile " +
+           "$SourceFiles " +
            "-L`"$WinDivertPath\$Arch`" " +
            "-lWinDivert -lws2_32 -liphlpapi " +
            "-o $OutputDLL"

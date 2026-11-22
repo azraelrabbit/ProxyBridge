@@ -441,6 +441,40 @@ Case 2: Packet match with proxy rule
 - TCP/UDP relay servers handle protocol conversion between raw sockets and proxy protocols
 
 
+The Windows packet path overlaps ordered `WinDivertRecvEx`/`WinDivertSendEx` batches: the next receive
+is posted before processing the current batch, and only one send is in flight. Receive buffers remain
+owned by the sender until completion. Unchanged packets can be sent from the receive buffer directly;
+rewrites happen in place, and batches containing blocked/deferred packets compact their surviving packets.
+Bulk batches (at least eight packets and 16 KiB) are submitted by one dedicated sender thread, so driver
+send work can overlap driver receive work even when the APIs complete synchronously. Smaller batches
+remain inline to avoid an additional scheduling hop. There is no timer to wait for a full batch.
+New flows wait for background process/rule classification; established flows continue while that work is pending.
+DIRECT decisions are cached by protocol, address family, local address/port and remote address/port.
+DIRECT packets still pass through WinDivert; this is not a kernel-bypass backend.
+
+Rules are precompiled into immutable matching snapshots, retaining the existing rule ordering and
+wildcard fallback. Activity callbacks run on a separate, bounded queue; an overloaded log consumer
+can omit activity events with a reported count rather than stalling traffic. The existing relay
+handoff remains source-port based and retains its existing multi-IP/same-port limitation.
+
+Activity Log lines prefixed `[Datapath v3.1]` identify this pipeline. While traffic is active, summaries
+appear about every 10 seconds with actual batch sizes, injected packet throughput, buffer reuse,
+pending queue peaks and I/O errors. Timing includes receive-batch processing, send submission/waiting
+and waiting for classification capacity; parser/cache timings sample one call in 1024. These measure
+intercepted packets, not application file-copy throughput (for example, a download can primarily expose
+outbound ACKs). A final partial summary is also emitted when stopping.
+The second summary line includes receive API time, bulk/inline batch counts and queue P95/P99, so the
+latency fields accompany the timing counters rather than depending on a separate log line. Receive and send time can
+overlap and must not be added as serial time. P95/P99 are histogram upper bounds for the oldest packet's
+capture-to-submit age in each batch, including worker scheduling. They are local queue measurements,
+not per-packet latency percentiles, wire delivery latency, or end-to-end meeting RTT.
+
+The driver-free `test_datapath` regression covers ordered classification, unrelated-flow progress,
+batch injection recovery, receive-ahead, send-buffer ownership/cancellation, mixed DIRECT/PROXY/BLOCK
+compaction, log backpressure and comparison with the legacy matcher.
+It also checks real bulk-thread execution, concurrent receive progress while the send call is blocked,
+small-batch inline submission, worker cancellation and queue-latency histogram boundaries.
+
 ## Build from Source
 
 ### Requirements

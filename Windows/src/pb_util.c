@@ -2,6 +2,117 @@
 
 // Utilities: logging, string/IP helpers, token parsing, socket setup, base64.
 
+/* Callbacks may perform synchronous pipe/console I/O. Keep that backpressure off
+ * both the ordered packet consumer and the new-flow classifier. */
+#define PB_EVENT_CAPACITY 2048
+typedef struct {
+    BOOL connection;
+    DWORD pid;
+    UINT16 port;
+    char process[MAX_PROCESS_NAME], ip[64], info[128];
+    char message[LOG_BUFFER_SIZE];
+} PB_EVENT;
+static SRWLOCK g_event_lock;
+static PB_EVENT *g_events;
+static UINT g_event_head, g_event_count;
+static HANDLE g_event_thread, g_event_wake;
+static BOOL g_event_stopping;
+static volatile LONG g_event_dropped;
+
+static DWORD WINAPI event_dispatcher(void *unused)
+{
+    (void)unused;
+    for (;;) {
+        PB_EVENT event;
+        AcquireSRWLockExclusive(&g_event_lock);
+        if (g_event_stopping) { ReleaseSRWLockExclusive(&g_event_lock); break; }
+        if (!g_event_count) {
+            ResetEvent(g_event_wake);
+            ReleaseSRWLockExclusive(&g_event_lock);
+            WaitForSingleObject(g_event_wake, INFINITE);
+            continue;
+        }
+        event = g_events[g_event_head];
+        g_event_head = (g_event_head + 1) % PB_EVENT_CAPACITY; g_event_count--;
+        ReleaseSRWLockExclusive(&g_event_lock);
+        LONG dropped = InterlockedExchange(&g_event_dropped, 0);
+        if (dropped && g_log_callback) {
+            char msg[128];
+            snprintf(msg, sizeof(msg), "Activity log overloaded: %ld events omitted; traffic processing continued", dropped);
+            g_log_callback(msg);
+        }
+        if (event.connection) {
+            if (g_connection_callback) g_connection_callback(event.process, event.pid, event.ip, event.port, event.info);
+        } else if (g_log_callback) g_log_callback(event.message);
+    }
+    return 0;
+}
+
+BOOL pb_events_start(void)
+{
+    if (g_event_thread) return TRUE;
+    g_events = calloc(PB_EVENT_CAPACITY, sizeof(*g_events));
+    g_event_wake = CreateEventW(NULL, TRUE, FALSE, NULL);
+    g_event_head = g_event_count = 0; g_event_stopping = FALSE; g_event_dropped = 0;
+    if (g_events && g_event_wake) g_event_thread = CreateThread(NULL, 0, event_dispatcher, NULL, 0, NULL);
+    if (g_event_thread) return TRUE;
+    free(g_events); g_events = NULL;
+    if (g_event_wake) CloseHandle(g_event_wake);
+    g_event_wake = NULL;
+    return FALSE;
+}
+
+void pb_events_stop(void)
+{
+    if (!g_event_thread) return;
+    AcquireSRWLockExclusive(&g_event_lock);
+    g_event_stopping = TRUE;
+    SetEvent(g_event_wake);
+    ReleaseSRWLockExclusive(&g_event_lock);
+    /* Repeat cancellation to cover a callback entering WriteFile just after the
+     * stop flag is set. Never leave callback code running after DLL unload. */
+    do { CancelSynchronousIo(g_event_thread); }
+    while (WaitForSingleObject(g_event_thread, 50) == WAIT_TIMEOUT);
+    AcquireSRWLockExclusive(&g_event_lock);
+    CloseHandle(g_event_thread); CloseHandle(g_event_wake);
+    g_event_thread = g_event_wake = NULL;
+    free(g_events); g_events = NULL; g_event_count = 0; g_event_stopping = FALSE;
+    ReleaseSRWLockExclusive(&g_event_lock);
+}
+
+static BOOL queue_event(const PB_EVENT *event)
+{
+    BOOL queued = FALSE;
+    AcquireSRWLockExclusive(&g_event_lock);
+    if (g_events && !g_event_stopping) {
+        if (g_event_count < PB_EVENT_CAPACITY) {
+            g_events[(g_event_head + g_event_count) % PB_EVENT_CAPACITY] = *event;
+            g_event_count++; SetEvent(g_event_wake);
+        } else InterlockedIncrement(&g_event_dropped);
+        queued = TRUE;
+    } else if (g_event_stopping) queued = TRUE;
+    ReleaseSRWLockExclusive(&g_event_lock);
+    return queued;
+}
+
+void pb_emit_log(const char *msg)
+{
+    PB_EVENT event = {0};
+    strncpy_s(event.message, sizeof(event.message), msg, _TRUNCATE);
+    if (!queue_event(&event) && g_log_callback) g_log_callback(event.message);
+}
+
+void pb_emit_connection(const char *process, DWORD pid, const char *ip, UINT16 port, const char *info)
+{
+    PB_EVENT event = {0};
+    event.connection = TRUE; event.pid = pid; event.port = port;
+    strncpy_s(event.process, sizeof(event.process), process, _TRUNCATE);
+    strncpy_s(event.ip, sizeof(event.ip), ip, _TRUNCATE);
+    strncpy_s(event.info, sizeof(event.info), info, _TRUNCATE);
+    if (!queue_event(&event) && g_connection_callback)
+        g_connection_callback(event.process, pid, event.ip, port, event.info);
+}
+
 void log_message(const char *msg, ...)
 {
     if (g_log_callback == NULL) return;
@@ -10,7 +121,7 @@ void log_message(const char *msg, ...)
     va_start(args, msg);
     vsnprintf(buffer, sizeof(buffer), msg, args);
     va_end(args);
-    g_log_callback(buffer);
+    pb_emit_log(buffer);
 }
 
 // Extract filename from full path  C:\path\chrome.exe  >> chrome.exe
